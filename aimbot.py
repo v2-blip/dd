@@ -3877,25 +3877,15 @@ class Aimbot:
         return (min(xs), min(ys), max(xs), max(ys))
 
     def _compensate_aim_point_for_camera_motion(self):
-        """Move the complete locked-target state into the newest camera frame.
+        """Move the prior filtered hitbox anchor into the current camera frame.
 
-        This runs once after each captured frame's camera-flow estimate. Keeping
-        the target center, box, hitbox and filter state in the same frame prevents
-        a detection gap from applying only the final camera shift on reacquisition.
+        Doing this before the 1-euro filter removes the large common screen shift
+        caused by manual camera movement. The filter then smooths only residual
+        target motion/detection noise, rather than lagging behind every pan.
         """
         affine = getattr(self, '_camera_motion_affine', None)
         if affine is None:
             return
-
-        if self._aim_track_center_x is not None and self._aim_track_center_y is not None:
-            self._aim_track_center_x, self._aim_track_center_y = self._camera_transform_point(
-                self._aim_track_center_x, self._aim_track_center_y
-            )
-        if self._aim_locked_box is not None:
-            self._aim_locked_box = self._camera_transform_box(self._aim_locked_box)
-        if self._aim_locked_hitbox is not None:
-            self._aim_locked_hitbox = self._camera_transform_box(self._aim_locked_hitbox)
-
         if self._filtered_aim_x is not None and self._filtered_aim_y is not None:
             self._filtered_aim_x, self._filtered_aim_y = self._camera_transform_point(
                 self._filtered_aim_x, self._filtered_aim_y
@@ -4644,10 +4634,9 @@ class Aimbot:
 
         last_time = self._aim_track_last_time or now
         elapsed = min(0.80, max(0.001, now - last_time))
-        # The locked center is already advanced to this frame immediately
-        # after capture; do not apply the same camera transform twice.
-        flow_x = float(self._aim_track_center_x)
-        flow_y = float(self._aim_track_center_y)
+        flow_x, flow_y = self._camera_transform_point(
+            self._aim_track_center_x, self._aim_track_center_y
+        )
         # During a brief detector-ID handoff, compare candidates against the
         # last measured target motion as well as camera flow. The lead is short
         # and bounded so it cannot turn into an unbounded extrapolated lock.
@@ -4661,8 +4650,7 @@ class Aimbot:
         association_cap = max(18.0, min(70.0, box_diag * 0.75))
         expected_x = flow_x + max(-association_cap, min(association_cap, velocity_x * association_lead_time))
         expected_y = flow_y + max(-association_cap, min(association_cap, velocity_y * association_lead_time))
-        # _aim_locked_box is maintained in the current camera frame.
-        ox1, oy1, ox2, oy2 = map(float, self._aim_locked_box)
+        ox1, oy1, ox2, oy2 = map(float, self._camera_transform_box(self._aim_locked_box))
         old_w = max(1.0, ox2 - ox1)
         old_h = max(1.0, oy2 - oy1)
         diagonal = math.hypot(old_w, old_h)
@@ -4831,31 +4819,12 @@ class Aimbot:
             capture_anchor = bool(new_target or anchor_missing or manual_retarget)
 
         if capture_anchor:
-            if new_target and not head_mode and not manual_retarget:
-                # Prefer the box center for a direct, stable body reference.
-                # If that center lies outside the active FOV, use the nearest
-                # in-hitbox point to the FOV center so the first command remains
-                # inside the configured acquisition boundary.
-                center_x = (left + right) * 0.5
-                center_y = (top + bottom) * 0.5
-                if self._aim_point_inside_fov(center_x, center_y):
-                    point_x, point_y = center_x, center_y
-                    self._aim_anchor_mode = 'CENTER'
-                else:
-                    fov_x, fov_y = self._fov_center_local()
-                    point_x = min(right, max(left, fov_x))
-                    point_y = min(bottom, max(top, fov_y))
-                    self._aim_anchor_mode = 'FOV'
-                self._aim_point_u = max(0.0, min(1.0, (point_x - left) / box_w))
-                self._aim_point_v = max(0.0, min(1.0, (point_y - top) / box_h))
-            else:
-                # Preserve deliberate manual placement when retargeting an
-                # already-locked hitbox.
-                point_x = min(right, max(left, reticle_x))
-                point_y = min(bottom, max(top, reticle_y))
-                self._aim_point_u = max(0.0, min(1.0, (point_x - left) / box_w))
-                self._aim_point_v = max(0.0, min(1.0, (point_y - top) / box_h))
-                self._aim_anchor_mode = 'INSIDE' if reticle_inside else 'EDGE'
+            # Clamp to the box when the user is still approaching from outside.
+            point_x = min(right, max(left, reticle_x))
+            point_y = min(bottom, max(top, reticle_y))
+            self._aim_point_u = max(0.0, min(1.0, (point_x - left) / box_w))
+            self._aim_point_v = max(0.0, min(1.0, (point_y - top) / box_h))
+            self._aim_anchor_mode = 'INSIDE' if reticle_inside else 'EDGE'
 
         # This is the core of the lock: preserve the same relative point as the
         # detected hitbox changes size or position from frame to frame.
@@ -4910,11 +4879,13 @@ class Aimbot:
                 self._aim_track_velocity_y = 0.0
                 self._aim_point_velocity_x = 0.0
                 self._aim_point_velocity_y = 0.0
-            # Camera compensation already advanced the prior center when the
-            # current frame was captured; measure only residual target movement.
-            track_dt = min(0.80, max(0.001, now - (self._aim_track_last_time or now)))
-            flow_cx = float(self._aim_track_center_x)
-            flow_cy = float(self._aim_track_center_y)
+            # Transform the previous point through global camera motion first,
+            # then measure only the target's newly detected residual movement.
+            self._compensate_aim_point_for_camera_motion()
+            track_dt = min(0.12, max(0.001, now - (self._aim_track_last_time or now)))
+            flow_cx, flow_cy = self._camera_transform_point(
+                self._aim_track_center_x, self._aim_track_center_y
+            )
             measured_vx = (cx - flow_cx) / track_dt
             measured_vy = (cy - flow_cy) / track_dt
             if abs(measured_vx) < 5.0:
@@ -4951,14 +4922,11 @@ class Aimbot:
                 self._stable_prev_error_y = None
                 self._stable_inside_deadzone = False
             else:
-                # A reacquired detection starts a new measurement segment.
-                # Reset the filter so its old derivative cannot carry momentum
-                # from the stale pre-occlusion observation into the new lock.
                 self._filtered_aim_x, self._aim_point_velocity_x = self._one_euro_point(
-                    'x', measured_x, now, reset=had_detection_gap
+                    'x', measured_x, now
                 )
                 self._filtered_aim_y, self._aim_point_velocity_y = self._one_euro_point(
-                    'y', measured_y, now, reset=had_detection_gap
+                    'y', measured_y, now
                 )
             self._aim_point_last_time = now
 
@@ -7690,9 +7658,6 @@ class Aimbot:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                 self._last_capture_ms = (time.perf_counter() - capture_started) * 1000.0
                 self._update_camera_motion(frame, frame_timestamp=frame_captured_at)
-                # Advance all locked-target coordinates on every captured frame,
-                # including frames where YOLO does not return a usable detection.
-                self._compensate_aim_point_for_camera_motion()
                 manual_dx, manual_dy = self._raw_mouse_input.consume()
                 self._manual_mouse_dx = manual_dx
                 self._manual_mouse_dy = manual_dy
