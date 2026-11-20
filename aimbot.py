@@ -4819,12 +4819,20 @@ class Aimbot:
             capture_anchor = bool(new_target or anchor_missing or manual_retarget)
 
         if capture_anchor:
-            # Clamp to the box when the user is still approaching from outside.
-            point_x = min(right, max(left, reticle_x))
-            point_y = min(bottom, max(top, reticle_y))
-            self._aim_point_u = max(0.0, min(1.0, (point_x - left) / box_w))
-            self._aim_point_v = max(0.0, min(1.0, (point_y - top) / box_h))
-            self._aim_anchor_mode = 'INSIDE' if reticle_inside else 'EDGE'
+            if new_target and not head_mode:
+                # Acquire a stable body reference instead of freezing the
+                # reticle's current pixel or the nearest hitbox edge.
+                self._aim_point_u = 0.50
+                self._aim_point_v = 0.50
+                self._aim_anchor_mode = 'CENTER'
+            else:
+                # Preserve deliberate manual placement when retargeting an
+                # already-locked hitbox.
+                point_x = min(right, max(left, reticle_x))
+                point_y = min(bottom, max(top, reticle_y))
+                self._aim_point_u = max(0.0, min(1.0, (point_x - left) / box_w))
+                self._aim_point_v = max(0.0, min(1.0, (point_y - top) / box_h))
+                self._aim_anchor_mode = 'INSIDE' if reticle_inside else 'EDGE'
 
         # This is the core of the lock: preserve the same relative point as the
         # detected hitbox changes size or position from frame to frame.
@@ -4922,11 +4930,14 @@ class Aimbot:
                 self._stable_prev_error_y = None
                 self._stable_inside_deadzone = False
             else:
+                # A reacquired detection starts a new measurement segment.
+                # Reset the filter so its old derivative cannot carry momentum
+                # from the stale pre-occlusion observation into the new lock.
                 self._filtered_aim_x, self._aim_point_velocity_x = self._one_euro_point(
-                    'x', measured_x, now
+                    'x', measured_x, now, reset=had_detection_gap
                 )
                 self._filtered_aim_y, self._aim_point_velocity_y = self._one_euro_point(
-                    'y', measured_y, now
+                    'y', measured_y, now, reset=had_detection_gap
                 )
             self._aim_point_last_time = now
 
